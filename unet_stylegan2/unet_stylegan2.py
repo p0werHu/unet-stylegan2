@@ -268,6 +268,7 @@ class Dataset(data.Dataset):
             transforms.Resize(image_size),
             RandomApply(aug_prob, transforms.RandomResizedCrop(image_size, scale=(0.85, 1.0), ratio=(1, 1)), transforms.CenterCrop(image_size)),
             transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
             transforms.Lambda(expand_greyscale(num_channels))
         ])
 
@@ -997,8 +998,8 @@ class Trainer():
         dec_out = torch.sigmoid(dec_out)
         dec_out = (dec_out - dec_out.min()) / (dec_out.max() - dec_out.min())
         visual_ret['generated_images'] = generated_images
-        visual_ret['dec_out'] = dec_out
-        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
+        visual_ret['dec_out'] = dec_out * 2 - 1
+        torchvision.utils.save_image((generated_images + 1) / 2.0, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
         torchvision.utils.save_image(dec_out, str(self.results_dir / self.name / f'{str(num)}-dec.{ext}'), nrow=num_rows)
 
         # moving averages
@@ -1010,8 +1011,8 @@ class Trainer():
         print(dec_out.max())
         print(dec_out.min())
         visual_ret['generated_images-ema'] = generated_images
-        visual_ret['dec_out-ema'] = dec_out
-        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-ema.{ext}'), nrow=num_rows)
+        visual_ret['dec_out-ema'] = dec_out * 2 - 1
+        torchvision.utils.save_image((generated_images + 1) / 2.0, str(self.results_dir / self.name / f'{str(num)}-ema.{ext}'), nrow=num_rows)
         torchvision.utils.save_image(dec_out, str(self.results_dir / self.name / f'{str(num)}-ema-dec.{ext}'), nrow=num_rows)
 
         # mixing regularities
@@ -1036,8 +1037,8 @@ class Trainer():
         dec_out = torch.sigmoid(dec_out)
         dec_out = (dec_out - dec_out.min()) / (dec_out.max() - dec_out.min())
         visual_ret['generated_images-mr'] = generated_images
-        visual_ret['dec_out-mr'] = dec_out
-        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-mr.{ext}'), nrow=num_rows)
+        visual_ret['dec_out-mr'] = dec_out * 2 - 1
+        torchvision.utils.save_image((generated_images + 1) / 2.0, str(self.results_dir / self.name / f'{str(num)}-mr.{ext}'), nrow=num_rows)
         torchvision.utils.save_image(dec_out, str(self.results_dir / self.name / f'{str(num)}-mr-dec.{ext}'), nrow=num_rows)
 
 
