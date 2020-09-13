@@ -1,6 +1,8 @@
 import os
 import sys
 import math
+from collections import OrderedDict
+
 import fire
 import json
 from tqdm import tqdm
@@ -26,6 +28,7 @@ from linear_attention_transformer import ImageLinearAttention
 
 from PIL import Image
 from pathlib import Path
+from util.visualizer import Visualizer
 
 try:
     from apex import amp
@@ -263,7 +266,7 @@ class Dataset(data.Dataset):
             transforms.Lambda(convert_image_fn),
             transforms.Lambda(partial(resize_to_minimum_size, image_size)),
             transforms.Resize(image_size),
-            RandomApply(aug_prob, transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0), ratio=(0.98, 1.02)), transforms.CenterCrop(image_size)),
+            RandomApply(aug_prob, transforms.RandomResizedCrop(image_size, scale=(0.85, 1.0), ratio=(1, 1)), transforms.CenterCrop(image_size)),
             transforms.ToTensor(),
             transforms.Lambda(expand_greyscale(num_channels))
         ])
@@ -612,6 +615,7 @@ class Discriminator(nn.Module):
 
         dec_out = self.conv_out(x)
         return enc_out.squeeze(), dec_out
+        #return enc_out.squeeze(), dec_out
 
 class StyleGAN2(nn.Module):
     def __init__(self, image_size, latent_dim = 512, fmap_max = 512, style_depth = 8, network_capacity = 16, transparent = False, fp16 = False, steps = 1, lr = 1e-4, ttur_mult = 2, no_const = False, lr_mul = 0.1):
@@ -624,7 +628,7 @@ class StyleGAN2(nn.Module):
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, no_const = no_const, fmap_max = fmap_max)
         self.D = Discriminator(image_size, network_capacity, transparent = transparent, fmap_max = fmap_max)
 
-        self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mul)
+        self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul=lr_mul)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, no_const = no_const)
 
         # wrapper for augmenting all images going into the discriminator
@@ -673,8 +677,51 @@ class StyleGAN2(nn.Module):
     def forward(self, x):
         return x
 
+class GanLoss(nn.Module):
+
+    def __init__(self, target_real_label=1.0, target_fake_label=0.0):
+        super().__init__()
+        self.register_buffer('real_label', torch.tensor(target_real_label))
+        self.register_buffer('fake_label', torch.tensor(target_fake_label))
+        self.loss = nn.BCEWithLogitsLoss()
+        self.cuda()
+
+    def get_target_tensor(self, prediction, target_is_real):
+        """Create label tensors with the same size as the input.
+
+        Parameters:
+            prediction (tensor) - - tpyically the prediction from a discriminator
+            target_is_real (bool) - - if the ground truth label is for real images or fake images
+
+        Returns:
+            A label tensor filled with ground truth label, and with the size of the input
+        """
+
+        if target_is_real:
+            target_tensor = self.real_label
+        else:
+            target_tensor = self.fake_label
+        return target_tensor.expand_as(prediction)
+
+    def __call__(self, prediction, target_is_real, target_mask=None):
+        """Calculate loss given Discriminator's output and grount truth labels.
+
+        Parameters:
+            prediction (tensor) - - tpyically the prediction output from a discriminator
+            target_is_real (bool) - - if the ground truth label is for real images or fake images
+
+        Returns:
+            the calculated loss.
+        """
+        if target_mask == None:
+            target_tensor = self.get_target_tensor(prediction, target_is_real)
+        else:
+            target_tensor = target_mask
+        loss = self.loss(prediction, target_tensor)
+        return loss
+
 class Trainer():
-    def __init__(self, name, results_dir, models_dir, image_size, network_capacity, transparent = False, batch_size = 4, mixed_prob = 0.9, gradient_accumulate_every=1, lr = 2e-4, ttur_mult = 2, num_workers = None, save_every = 1000, trunc_psi = 0.6, fp16 = False, no_const = False, aug_prob = 0., dataset_aug_prob = 0., cr_weight = 0.2, lr_mul = 0.1, *args, **kwargs):
+    def __init__(self, name, results_dir, models_dir, image_size, network_capacity, transparent = False, batch_size = 4, mixed_prob = 0.9, gradient_accumulate_every=1, lr = 2e-4, ttur_mult = 2, num_workers = None, save_every = 1000, trunc_psi = 0.6, fp16 = False, no_const = False, aug_prob = 0., dataset_aug_prob = 0., cr_weight = 1, lr_mul = 0.1, gpu_ids=[0],*args, **kwargs):
         self.GAN_params = [args, kwargs]
         self.GAN = None
 
@@ -682,6 +729,7 @@ class Trainer():
         self.results_dir = Path(results_dir)
         self.models_dir = Path(models_dir)
         self.config_path = self.models_dir / name / '.config.json'
+        self.gpu_ids = gpu_ids
 
         assert log2(image_size).is_integer(), 'image size must be a power of 2 (64, 128, 256, 512, 1024)'
         self.image_size = image_size
@@ -724,9 +772,28 @@ class Trainer():
 
         self.cr_weight = cr_weight
 
+        # instance Visualizer
+        class Opt:
+
+            def __init__(self) :
+                super().__init__()
+                self.display_id = 1
+                self.use_html = False
+                self.display_winsize = 256
+                self.name = 'experiment'
+                self.display_port = 8097
+                self.display_server = "http://localhost"
+                self.display_env = 'main'
+                self.display_ncols = 4
+        opt = Opt()
+        self.visualizer = Visualizer(opt)  # create a visualizer that display/save images and plots
+
     def init_GAN(self):
         args, kwargs = self.GAN_params
         self.GAN = StyleGAN2(lr = self.lr, ttur_mult = self.ttur_mult, lr_mul = self.lr_mul, image_size = self.image_size, network_capacity = self.network_capacity, transparent = self.transparent, fp16 = self.fp16, no_const = self.no_const, *args, **kwargs)
+        # if len(self.gpu_ids) > 0:
+        #     assert (torch.cuda.is_available())
+        #     self.GAN = torch.nn.DataParallel(self.GAN, self.gpu_ids)  # multi-GPUs
 
     def write_config(self):
         self.config_path.write_text(json.dumps(self.config()))
@@ -753,6 +820,7 @@ class Trainer():
         if self.GAN is None:
             self.init_GAN()
 
+        self.criterionGAN = GanLoss()
         self.GAN.train()
         total_disc_loss = torch.tensor(0.).cuda()
         total_gen_loss = torch.tensor(0.).cuda()
@@ -763,7 +831,7 @@ class Trainer():
         latent_dim = self.GAN.G.latent_dim
         num_layers = self.GAN.G.num_layers
 
-        aug_prob   = self.aug_prob
+        aug_prob = self.aug_prob
 
         apply_gradient_penalty = self.steps < 4000 or self.steps % 4 == 0
         apply_path_penalty = self.steps % 32 == 0
@@ -773,7 +841,7 @@ class Trainer():
 
         backwards = partial(loss_backwards, self.fp16)
 
-        # train discriminator
+        # train discriminatormixed_list
 
         avg_pl_length = self.pl_mean
         self.GAN.D_opt.zero_grad()
@@ -793,8 +861,10 @@ class Trainer():
             real_images.requires_grad_()
             (real_enc_out, real_dec_out), real_aug_images = self.GAN.D_aug(real_images, prob = aug_prob)
 
-            enc_divergence = (F.relu(1 + real_enc_out) + F.relu(1 - fake_enc_out)).mean()
-            dec_divergence = (F.relu(1 + real_dec_out) + F.relu(1 - fake_dec_out)).mean()
+            # enc_divergence = (F.relu(1 + real_enc_out) + F.relu(1 - fake_enc_out)).mean()
+            # dec_divergence = (F.relu(1 + real_dec_out) + F.relu(1 - fake_dec_out)).mean()
+            enc_divergence = self.criterionGAN(real_enc_out, True) + self.criterionGAN(fake_enc_out, False)
+            dec_divergence = self.criterionGAN(real_dec_out, True) + self.criterionGAN(fake_dec_out, False)
             divergence = enc_divergence + dec_divergence
 
             disc_loss = divergence
@@ -812,8 +882,10 @@ class Trainer():
                 cutmix_images = mask_src_tgt(real_aug_images, fake_aug_images, mask)
                 cutmix_enc_out, cutmix_dec_out = self.GAN.D(cutmix_images)
 
-                cutmix_enc_divergence = F.relu(1 - cutmix_enc_out).mean()
-                cutmix_dec_divergence =  F.relu(1 + (mask * 2 - 1) * cutmix_dec_out).mean()
+                # cutmix_enc_divergence = F.relu(1 - cutmix_enc_out).mean()
+                # cutmix_dec_divergence =  F.relu(1 + (mask * 2 - 1) * cutmix_dec_out).mean()
+                cutmix_enc_divergence = self.criterionGAN(cutmix_enc_out, False)
+                cutmix_dec_divergence = self.criterionGAN(cutmix_dec_out, True, mask)
                 disc_loss = disc_loss + cutmix_enc_divergence + cutmix_dec_divergence
 
                 cr_cutmix_dec_out = mask_src_tgt(real_dec_out, fake_dec_out, mask)
@@ -849,7 +921,8 @@ class Trainer():
 
             generated_images = self.GAN.G(w_styles, noise)
             (fake_enc_output, fake_dec_output), _ = self.GAN.D_aug(generated_images, prob = aug_prob)
-            loss = fake_enc_output.mean() + F.relu(1 + fake_dec_output).mean()
+            #loss = fake_enc_output.mean() + F.relu(1 + fake_dec_output).mean()
+            loss = self.criterionGAN(fake_enc_output, True) + self.criterionGAN(fake_dec_output, True)
             gen_loss = loss
 
             if apply_path_penalty:
@@ -904,6 +977,7 @@ class Trainer():
     @torch.no_grad()
     def evaluate(self, num = 0, num_image_tiles = 8, trunc = 1.0):
         self.GAN.eval()
+        visual_ret = OrderedDict()
         ext = 'jpg' if not self.transparent else 'png'
         num_rows = num_image_tiles
     
@@ -919,12 +993,26 @@ class Trainer():
         # regular
 
         generated_images = self.generate_truncated(self.GAN.S, self.GAN.G, latents, n, trunc_psi = self.trunc_psi)
+        _, dec_out = self.GAN.D(generated_images)
+        dec_out = torch.sigmoid(dec_out)
+        dec_out = (dec_out - dec_out.min()) / (dec_out.max() - dec_out.min())
+        visual_ret['generated_images'] = generated_images
+        visual_ret['dec_out'] = dec_out
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
-        
+        torchvision.utils.save_image(dec_out, str(self.results_dir / self.name / f'{str(num)}-dec.{ext}'), nrow=num_rows)
+
         # moving averages
 
         generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, n, trunc_psi = self.trunc_psi)
+        _, dec_out = self.GAN.D(generated_images)
+        dec_out = torch.sigmoid(dec_out)
+        dec_out = (dec_out - dec_out.min()) / (dec_out.max() - dec_out.min())
+        print(dec_out.max())
+        print(dec_out.min())
+        visual_ret['generated_images-ema'] = generated_images
+        visual_ret['dec_out-ema'] = dec_out
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-ema.{ext}'), nrow=num_rows)
+        torchvision.utils.save_image(dec_out, str(self.results_dir / self.name / f'{str(num)}-ema-dec.{ext}'), nrow=num_rows)
 
         # mixing regularities
 
@@ -944,7 +1032,16 @@ class Trainer():
         mixed_latents = [(tmp1, tt), (tmp2, num_layers - tt)]
 
         generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, mixed_latents, n, trunc_psi = self.trunc_psi)
+        _, dec_out = self.GAN.D(generated_images)
+        dec_out = torch.sigmoid(dec_out)
+        dec_out = (dec_out - dec_out.min()) / (dec_out.max() - dec_out.min())
+        visual_ret['generated_images-mr'] = generated_images
+        visual_ret['dec_out-mr'] = dec_out
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-mr.{ext}'), nrow=num_rows)
+        torchvision.utils.save_image(dec_out, str(self.results_dir / self.name / f'{str(num)}-mr-dec.{ext}'), nrow=num_rows)
+
+
+        self.visualizer.display_current_results(visual_ret, self.steps, False)
 
     @torch.no_grad()
     def generate_truncated(self, S, G, style, noi, trunc_psi = 0.75, num_image_tiles = 8):
@@ -1002,9 +1099,16 @@ class Trainer():
             for ind, frame in enumerate(frames):
                 frame.save(str(folder_path / f'{str(ind)}.{ext}'))
 
-    def print_log(self):
+    def print_log(self, num_train_steps):
+        loss_ret = OrderedDict()
+        loss_ret['g_loss'] = self.g_loss
+        loss_ret['d_loss'] = self.d_loss
+        loss_ret['last_gp_loss'] = self.last_gp_loss
+        loss_ret['last_cr_loss'] = self.last_cr_loss
         pl_mean = default(self.pl_mean, 0)
+        loss_ret['pl_mean'] = pl_mean
         print(f'G: {self.g_loss:.2f} | D: {self.d_loss:.2f} | GP: {self.last_gp_loss:.2f} | PL: {pl_mean:.2f} | CR: {self.last_cr_loss:.2f}')
+        self.visualizer.plot_current_losses(self.steps-1, float(self.steps) / num_train_steps, loss_ret)
 
     def model_name(self, num):
         return str(self.models_dir / self.name / f'model_{num}.pt')

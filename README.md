@@ -2,25 +2,10 @@
 
 ## UNet Stylegan2
 
-An implementation of Stylegan2 with UNet Discriminator. This repository works largely the same way as <a href="https://github.com/lucidrains/stylegan2-pytorch">Stylegan2 Pytorch</a>. Simply replace all the `stylegan2_pytorch` command with `unet_stylegan2` instead.
+An implementation of Stylegan2 with UNet Discriminator. This repository works largely the same way as <a href="https://github.com/lucidrains/stylegan2-pytorch">Stylegan2 Pytorch</a>. 
 
-<img src="./samples/flowers.jpg"></img>
+I replace the loss function to BCE loss and add visdom module to display the training process
 
-<img src="./samples/flowers-mr.jpg"></img>
-
-Update: Results have been very good. Will need to investigate combining this with a few other techniques, and then I will write up full instructions for use.
-
-## Install
-
-```bash
-$ pip install unet-stylegan2
-```
-
-## Usage
-
-```bash
-$ unet_stylegan2 --data ./path/to/data
-```
 
 ## Citations
 
